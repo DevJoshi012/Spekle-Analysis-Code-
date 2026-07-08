@@ -4,6 +4,7 @@
 import numpy as np
 from scipy.signal import correlate2d #performs cross-correlation between two matrices using FFT as its basis algorithm
 from scipy.optimize import curve_fit #least squares non-linear curve fitting module
+from scipy.ndimage import uniform_filter
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -42,10 +43,88 @@ def normalized_cross_correlation(template, search): #template window is the smal
 
     return ncc
 
+#scc correlation algorithm which is friendly to gaussian apodization
+def scc_correlation(template, search):
+    """
+    FFT-based correlation plane. Apodization friendly unlike ncc
+    """
+    t = template.astype(np.float64)
+    s = search.astype(np.float64)
+
+    # mean-subtract both (removes DC / brightness offset)
+    t -= t.mean()
+    s -= s.mean()
+
+    # pad template to search size so FFTs are compatible
+    th, tw = t.shape
+    sh, sw = s.shape
+    t_padded = np.zeros_like(s)
+    t_padded[:th, :tw] = t
+
+    # FFT correlation: conj(F(t)) * F(s), inverse transform
+    F_t = np.fft.fft2(t_padded)
+    F_s = np.fft.fft2(s)
+    corr = np.fft.ifft2(np.conj(F_t) * F_s).real
+
+    # shift zero-lag to the centre so the peak finder's centring works
+    corr = np.fft.fftshift(corr)
+    return corr
+
+#scc correlation with normalization:
+def scc_correlation_normalized(template, search, apodization_window=None):
+    """
+    Normalized FFT cross-correlation plane.
+ 
+    Parameters
+    ----------
+    template          : 2D array (th, tw)
+    search            : 2D array (sh, sw), must be larger than template
+    apodization_window: optional 2D array, same shape as template.
+                        NOTE: on this data apodization did NOT help even after
+                        normalization (it degrades the match). Left optional
+                        for experimentation only.
+ 
+    Returns
+    -------
+    ncc : 2D normalized correlation plane, zero-lag at the centre.
+    """
+    t = template.astype(np.float64)
+    s = search.astype(np.float64)
+ 
+    if apodization_window is not None:
+        t = t * apodization_window
+ 
+    t -= t.mean()
+ 
+    th, tw = t.shape
+    sh, sw = s.shape
+ 
+    # --- numerator: FFT correlation of mean-subtracted template with search ---
+    t_padded = np.zeros_like(s)
+    r0 = (sh - th) // 2
+    c0 = (sw - tw) // 2
+    t_padded[r0:r0 + th, c0:c0 + tw] = t
+ 
+    num = np.fft.fftshift(
+        np.fft.ifft2(np.conj(np.fft.fft2(t_padded)) * np.fft.fft2(s)).real
+    )
+ 
+    # --- denominator: local energy of the search at every window position ---
+    # local std over a (th x tw) window = sqrt(E[x^2] - E[x]^2)
+    win_mean   = uniform_filter(s,     size=(th, tw), mode="constant")
+    win_sqmean = uniform_filter(s * s, size=(th, tw), mode="constant")
+    win_var    = np.maximum(win_sqmean - win_mean ** 2, 0.0)
+    win_norm   = np.sqrt(win_var) * np.sqrt(th * tw)
+ 
+    t_norm = np.linalg.norm(t)
+    denom  = t_norm * win_norm + 1e-8
+ 
+    return num / denom
+ 
 
 #using the above function to cross correlate the known synthetic data
 t_half_size = 10 #template half size
-s_half_size = 64 #search half size
+s_half_size = 40 #search half size
 
 #required paths
 im_sim_path = "C:\\Users\\Dev Joshi\\Box\\aether.lab\\people\\Dev Joshi\\SpekleAnalysis\\GroundTruthOpen\\Data\\solution\\Philips\\im_sim.mat"
@@ -56,8 +135,39 @@ im_sim, x_gt, aha, x_axis, y_axis = load(im_sim_path, ground_truth_path, info_ma
 
 
 
-#print(ncc_res)
 
+#loop implementation for all nodes scc function:
+def single_scc(t_half_size, s_half_size, frame=49, window_size=0.5):
+    x_t, y_t = get_nodes(x_gt, x_axis, y_axis, frame-1)
+    temp_windows   = get_window_coords(x_t, y_t, t_half_size)
+    search_windows = get_window_coords(x_t, y_t, s_half_size)
+
+    # apodization window sized to the TEMPLATE
+    gw = gaussian_apodization_window(
+        dimensions=(2*t_half_size+1, 2*t_half_size+1),
+        window_size=(window_size, window_size),
+        window_type='fraction'
+    )
+
+    out = []
+    for i in range(len(temp_windows)):
+        t = extract(im_sim, temp_windows,   frame-1, i).astype(np.float64) #frame - 1 changed to frame 
+        s = extract(im_sim, search_windows, frame,   i).astype(np.float64)
+
+        #t_windowed = t * gw                    # apodize BEFORE the FFT
+        t_windowed = t
+        corr = scc_correlation_normalized(t_windowed, s)  # FFT correlation plane
+
+        peak = find_correlation_peak_2d(corr)  # designed for this plane
+        out.append((peak['u'], peak['v']))
+
+    return out
+
+
+
+"""
+All functions below this are using NCC instead of SCC implementation in correlation, hence do not result good results implementing apodization
+"""
 #function to iteratively get all nodal displacements based on the frame given: we have 50 frames in total
 
 def single_ncc(t_half_size, s_half_size, frame=49):
@@ -169,6 +279,50 @@ def single_ncc_gaussian(t_half_size, s_half_size, frame=49):
         node_disp_output.append((dx, dy))
 
     return node_disp_output
+
+#making a new gaussian function
+def single_ncc_gaussian_new(t_half_size, s_half_size, frame=49):
+    x_t, y_t = get_nodes(x_gt, x_axis, y_axis, frame-1)
+    
+    temp_windows = get_window_coords(x_t, y_t, t_half_size)
+    search_windows = get_window_coords(x_t, y_t, s_half_size)
+    
+    gauss_window = gaussian_apodization_window(
+        dimensions=(2 * t_half_size + 1, 2 * t_half_size + 1),
+        window_size=(0.5, 0.5),
+        window_type='fraction'
+    )
+    
+    template_data = []
+    search_data = []
+
+    for i in range(len(temp_windows)):
+        t = extract(im_sim, temp_windows, frame - 1, i)
+        s = extract(im_sim, search_windows, frame, i)
+        t_windowed = t.astype(np.float64) * gauss_window
+        template_data.append(t_windowed)
+        search_data.append(s)
+
+    node_disp_output = []
+    for i in range(len(template_data)):
+        ncc_result = normalized_cross_correlation(template_data[i], search_data[i])
+        peak_info = find_correlation_peak_2d(ncc_result)
+        
+        dx = peak_info['u']
+        dy = peak_info['v']
+        
+        node_disp_output.append((dx, dy))
+    
+    return node_disp_output
+        
+
+    #return node_disp_output
+
+
+"""
+Utility functions : to plot errors, confidence maps, displacement vectors as well as generate animation gifs
+"""
+
 #plotting the displacement vectors of the provided data
 def plot_displacement_vectors(im_sim, x1, y1, x2, y2, arr_pred, frame_idx=49, arrow_scale=20):
     """
@@ -229,6 +383,7 @@ def animate_displacement_vectors(im_sim, x_gt, x_axis, y_axis,
     import matplotlib.animation as animation
     
     n_frames = im_sim.shape[2]
+    #n_frames = 3
     
     fig, ax = plt.subplots(figsize=(10, 8))
     
@@ -518,6 +673,11 @@ def evaluate_tracking_performance(arr_gt, arr_pred):
     print("-------------------------------------------")
 #displacement visualization for one (specified or default frame)
 #plot_displacement_vectors(im_sim, x1, y1, x2, y2, arr_pred)
+
+"""
+implementing the functions to generate results here:
+"""
+
 """
 peak_values = plot_ncc_confidence_map(im_sim, x_gt, x_axis, y_axis,
                                       single_ncc, t_half_size, s_half_size,
@@ -530,14 +690,15 @@ animate_displacement_vectors(im_sim, x_gt, x_axis, y_axis,
                               mm_to_pixels, name = 'ncc_gaussian_new', arrow_scale=20, fps=5)
 """
 
+
 animate_displacement_vectors(im_sim, x_gt, x_axis, y_axis,
-                              single_ncc_gaussian, t_half_size, s_half_size,
-                              mm_to_pixels, name='ncc_gaussian_new', arrow_scale=20, fps=5)
+                              single_scc, t_half_size, s_half_size,
+                              mm_to_pixels, name='scc_gaussian_2', arrow_scale=20, fps=5)
 
 """
 error_stats2 = plot_error_map_all_frames(im_sim, x_gt, x_axis, y_axis,
-                                        single_ncc_gaussian, t_half_size, s_half_size,
+                                        single_scc, t_half_size, s_half_size,
                                         get_nodes, mm_to_pixels,
-                                        save_path='error_map_all_frames_gaussian_new.png')
+                                        save_path='error_map_all_frames_scc.png')
 
 """
