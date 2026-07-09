@@ -11,3 +11,5 @@
 - boundary_util : plots the boundary and the nodes associated with the boundary as per the synthetic data
 
 - executioner : program to run all the designated functions and keep scc_module code cleaner
+
+Results folder added for providing important results directly.
